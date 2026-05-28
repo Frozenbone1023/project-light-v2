@@ -552,7 +552,10 @@
                     const latitude = gpsDmsToDecimal(latitudeDms, latitudeRef);
                     const longitude = gpsDmsToDecimal(longitudeDms, longitudeRef);
 
-                    if (Number.isFinite(latitude) && Number.isFinite(longitude)) {
+                    // (0, 0)은 카메라가 GPS를 실제로 취득하지 못한 더미 좌표일 가능성이 높아 EXIF GPS 없음으로 처리합니다.
+                    if (latitude === 0 && longitude === 0) {
+                        resolve(null);
+                    } else if (Number.isFinite(latitude) && Number.isFinite(longitude)) {
                         resolve({ latitude, longitude, source: 'EXIF GPS' });
                     } else {
                         resolve(null);
@@ -579,7 +582,8 @@
                         const longitude = position.coords.longitude;
 
                         if (Number.isFinite(latitude) && Number.isFinite(longitude)) {
-                            resolve({ latitude, longitude, source: 'HTML5 Geolocation Fallback' });
+                            // 현재 위치는 업로드 시점 좌표이므로 촬영 위치와 다를 수 있음을 UI에 명시합니다.
+                            resolve({ latitude, longitude, source: '현재 위치 (촬영 위치와 다를 수 있음)' });
                         } else {
                             reject(new Error('Geolocation API가 유효하지 않은 좌표를 반환했습니다.'));
                         }
@@ -600,8 +604,21 @@
             const exifLocation = await extractExifGps(file);
             if (exifLocation) return exifLocation;
 
-            setStatus('EXIF GPS가 없어 현재 위치 권한을 요청합니다.', 'warn');
-            return getFallbackGeolocation();
+            // EXIF GPS가 없을 때는 현재 위치 사용의 신뢰도 한계를 사용자에게 확인받은 뒤 진행합니다.
+            setStatus('EXIF GPS가 없어 현재 위치를 사용할 수 있지만, 촬영 위치와 다를 수 있습니다.', 'warn');
+
+            const useCurrentLocation = window.confirm(
+                `${file.name}\n\nEXIF GPS가 없습니다.\n현재 위치는 촬영 위치와 다를 수 있습니다.\n현재 위치 좌표를 이 사진에 매칭할까요?`
+            );
+
+            if (!useCurrentLocation) {
+                setStatus(`${file.name} 건너뜀: EXIF GPS가 없고 현재 위치 사용이 취소되었습니다.`, 'warn');
+                return null;
+            }
+
+            const fallbackLocation = await getFallbackGeolocation();
+            setStatus('현재 위치 좌표를 사용했습니다. 촬영 위치와 다를 수 있으므로 CSV 해석 시 주의하세요.', 'warn');
+            return fallbackLocation;
         }
 
         /*
@@ -638,11 +655,19 @@
 
         /*
             Canvas 프리뷰 및 ROI 픽셀 처리:
-            - 원본 해상도를 그대로 Canvas에 올리면 모바일 메모리 사용량이 급증할 수 있으므로 표시용 Canvas는 축소합니다.
+            - 표시용 Canvas는 모바일 렌더링 비용을 줄이기 위해 최대 1600px로 축소합니다.
             - ROI 비율은 이미지 중심 기준 20% x 20%로 고정합니다.
-            - 휘도 계산은 표시용 Canvas 기준으로 수행합니다. 평균값 산출 목적에서는 균일 축소 후 중앙 ROI를 읽어도
-              전체 경향이 보존되며, 브라우저 메모리 안정성이 크게 좋아집니다.
+            - 휘도 계산은 별도 분석용 Canvas에서 수행하며, 원본이 6000px 이상이면 메모리 보호를 위해 최대 4000px로 제한합니다.
         */
+        function srgbToLinear(channelValue) {
+            const normalized = channelValue / 255;
+
+            // sRGB 감마 인코딩 값을 선형 광량 값으로 변환한 뒤 상대 휘도 계산에 사용합니다.
+            return normalized <= 0.04045
+                ? normalized / 12.92
+                : Math.pow((normalized + 0.055) / 1.055, 2.4);
+        }
+
         function drawImageAndCalculateLuminance(image) {
             const sourceWidth = image.width;
             const sourceHeight = image.height;
@@ -659,25 +684,41 @@
             emptyPreview.style.display = 'none';
             roiBox.style.display = 'block';
 
-            const roiWidth = Math.max(1, Math.floor(canvasWidth * 0.2));
-            const roiHeight = Math.max(1, Math.floor(canvasHeight * 0.2));
-            const roiX = Math.floor((canvasWidth - roiWidth) / 2);
-            const roiY = Math.floor((canvasHeight - roiHeight) / 2);
-            const imageData = previewContext.getImageData(roiX, roiY, roiWidth, roiHeight);
+            const maxSourceSide = Math.max(sourceWidth, sourceHeight);
+            const analysisMaxSide = maxSourceSide >= 6000 ? 4000 : maxSourceSide;
+            const analysisScale = Math.min(1, analysisMaxSide / maxSourceSide);
+            const analysisWidth = Math.max(1, Math.round(sourceWidth * analysisScale));
+            const analysisHeight = Math.max(1, Math.round(sourceHeight * analysisScale));
+            const analysisCanvas = document.createElement('canvas');
+            const analysisContext = analysisCanvas.getContext('2d', { willReadFrequently: true });
+
+            if (!analysisContext) {
+                throw new Error('Analysis canvas 2D context is not available in this browser.');
+            }
+
+            analysisCanvas.width = analysisWidth;
+            analysisCanvas.height = analysisHeight;
+            analysisContext.drawImage(image, 0, 0, analysisWidth, analysisHeight);
+
+            const roiWidth = Math.max(1, Math.floor(analysisWidth * 0.2));
+            const roiHeight = Math.max(1, Math.floor(analysisHeight * 0.2));
+            const roiX = Math.floor((analysisWidth - roiWidth) / 2);
+            const roiY = Math.floor((analysisHeight - roiHeight) / 2);
+            const imageData = analysisContext.getImageData(roiX, roiY, roiWidth, roiHeight);
             const rgba = imageData.data;
             const pixelCount = rgba.length / 4;
             let luminanceSum = 0;
 
             for (let i = 0; i < rgba.length; i += 4) {
-                const red = rgba[i];
-                const green = rgba[i + 1];
-                const blue = rgba[i + 2];
+                const red = srgbToLinear(rgba[i]);
+                const green = srgbToLinear(rgba[i + 1]);
+                const blue = srgbToLinear(rgba[i + 2]);
 
-                // ITU-R BT.709 / sRGB 계열에서 널리 쓰이는 상대 휘도 가중치입니다.
+                // 선형화된 RGB에 BT.709 계수를 적용해야 물리적으로 타당한 상대 휘도가 됩니다.
                 luminanceSum += (0.2126 * red) + (0.7152 * green) + (0.0722 * blue);
             }
 
-            return luminanceSum / pixelCount;
+            return (luminanceSum / pixelCount) * 255;
         }
 
         function addDatasetRecord(location, luminance) {
@@ -725,11 +766,21 @@
             const image = await loadImageFromFile(file);
             const luminance = drawImageAndCalculateLuminance(image);
             const location = await resolveLocation(file);
+
+            // 사용자가 현재 위치 폴백을 거부하면 해당 파일은 누적 데이터셋에 추가하지 않습니다.
+            if (!location) return;
+
             const record = addDatasetRecord(location, luminance);
 
             updateLatestMetrics(file.name, location, luminance);
             renderDatasetTable();
-            setStatus(`레코드 #${record.id} 저장 완료: 휘도 ${formatNumber(luminance, 4)}`, 'ok');
+
+            if (location.source === 'EXIF GPS') {
+                setStatus(`레코드 #${record.id} 저장 완료: 휘도 ${formatNumber(luminance, 4)}`, 'ok');
+            } else {
+                // 현재 위치 폴백 레코드는 저장 후에도 촬영 위치 불일치 가능성을 경고 상태로 유지합니다.
+                setStatus(`레코드 #${record.id} 저장 완료: 현재 위치 사용, 촬영 위치와 다를 수 있음`, 'warn');
+            }
         }
 
         imageInput.addEventListener('change', async () => {
